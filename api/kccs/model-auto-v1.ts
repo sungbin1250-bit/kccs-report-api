@@ -21,9 +21,8 @@ type PreviousReport = {
   status: string;
 };
 
-const SERVICE_VERSION = "kccs-model-auto-v2-actual-priority";
-const MODEL_VERSION = "kccs-model-auto-v2-hysteresis-030-010";
-const AUTO_START_DATE = "2026-08-12";
+const SERVICE_VERSION = "kccs-model-auto-v1-hysteresis";
+const MODEL_VERSION = "kccs-model-auto-v1-hysteresis-030-010";
 const ENTRY_THRESHOLD = 0.30;
 const EXIT_BUFFER = 0.10;
 const ACTIVE_LEVERAGE = 2;
@@ -237,8 +236,6 @@ export default {
             activeAllocation: ACTIVE_ALLOCATION,
             activeEstimatedCost: ACTIVE_COST,
             waitLeverage: 0,
-            autoStartDate: AUTO_START_DATE,
-            priority: "CONFIRMED_ACTUAL_SIGNAL_FIRST",
           },
         },
         {
@@ -387,105 +384,6 @@ export default {
       );
     }
 
-    // A confirmed non-auto signal is the authoritative KCCS decision.
-    // This is checked BEFORE the automatic model. Therefore an actual
-    // operator-confirmed LONG/SHORT/WAIT can never be replaced by the
-    // candidate/hysteresis algorithm for the same trading day.
-    const { data: existingSignalData, error: existingSignalReadError } =
-      await supabase
-        .from("kccs_model_signals")
-        .select(
-          "report_date,status,direction,leverage,allocation,estimated_cost,model_version,source,confirmed_at"
-        )
-        .eq("report_date", targetDate)
-        .eq("status", "CONFIRMED")
-        .maybeSingle();
-
-    if (existingSignalReadError) {
-      return Response.json(
-        {
-          error: "EXISTING_SIGNAL_READ_ERROR",
-          message: existingSignalReadError.message,
-        },
-        { status: 500, headers: cors }
-      );
-    }
-
-    const existingSignalSource = String(existingSignalData?.source || "");
-    const isExistingAutoSignal =
-      existingSignalSource.startsWith("KCCS AUTO MODEL");
-
-    if (existingSignalData && !isExistingAutoSignal) {
-      const actualDirection = existingSignalData.direction as Direction;
-      const actualLeverage =
-        actualDirection === "WAIT" ? 0 : Math.max(0, n(existingSignalData.leverage));
-      const actualAllocation =
-        actualDirection === "WAIT"
-          ? 0
-          : Math.min(100, Math.max(0, n(existingSignalData.allocation)));
-      const actualEstimatedCost =
-        actualDirection === "WAIT"
-          ? 0
-          : Math.max(0, n(existingSignalData.estimated_cost));
-
-      return Response.json(
-        {
-          ok: true,
-          serviceVersion: SERVICE_VERSION,
-          status: dryRun ? "DRY_RUN_OK" : "SIGNAL_CONFIRMED",
-          targetDate,
-          authoritativeSignal: true,
-          authoritativeSource: existingSignalSource,
-          market: {
-            samsungReturn: market.stocks?.["005930"]?.changeRate,
-            skHynixReturn: market.stocks?.["000660"]?.changeRate,
-            underlyingReturn: currentUnderlying,
-          },
-          previousReport: null,
-          decision: {
-            direction: actualDirection,
-            decisionState: actualDirection,
-            reason: "CONFIRMED_ACTUAL_SIGNAL_PRIORITY",
-            leverage: actualLeverage,
-            allocation: actualAllocation,
-            estimatedCost: actualEstimatedCost,
-          },
-          signalPreview: existingSignalData,
-          rules: {
-            entryThreshold: ENTRY_THRESHOLD,
-            exitBuffer: EXIT_BUFFER,
-            confirmation: "2_CONSECUTIVE_TRADING_DAYS",
-            candidateEffectiveDirection: "WAIT",
-            autoStartDate: AUTO_START_DATE,
-            priority: "CONFIRMED_ACTUAL_SIGNAL_FIRST",
-          },
-        },
-        {
-          status: 200,
-          headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
-        }
-      );
-    }
-
-    // Before the automatic model launch date, an actual confirmed signal
-    // is mandatory. This makes 2026-08-11 the human-confirmed baseline
-    // and starts automatic decisions from 2026-08-12.
-    if (targetDate < AUTO_START_DATE) {
-      return Response.json(
-        {
-          ok: true,
-          status: "WAITING",
-          reason: "ACTUAL_SIGNAL_REQUIRED_BEFORE_AUTO_START",
-          targetDate,
-          autoStartDate: AUTO_START_DATE,
-        },
-        {
-          status: 200,
-          headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
-        }
-      );
-    }
-
     // Previous confirmed trading report, regardless of month.
     const { data: previousRows, error: previousError } = await supabase
       .from("kccs_daily_reports")
@@ -557,8 +455,6 @@ export default {
         exitBuffer: EXIT_BUFFER,
         confirmation: "2_CONSECUTIVE_TRADING_DAYS",
         candidateEffectiveDirection: "WAIT",
-        autoStartDate: AUTO_START_DATE,
-        priority: "CONFIRMED_ACTUAL_SIGNAL_FIRST",
       },
     };
 
@@ -567,6 +463,44 @@ export default {
         status: 200,
         headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
       });
+    }
+
+    // Do not overwrite a manually entered confirmed signal unless forced.
+    const { data: existingSignal, error: existingSignalError } =
+      await supabase
+        .from("kccs_model_signals")
+        .select("report_date,status,source")
+        .eq("report_date", targetDate)
+        .maybeSingle();
+
+    if (existingSignalError) {
+      return Response.json(
+        {
+          error: "EXISTING_SIGNAL_READ_ERROR",
+          message: existingSignalError.message,
+        },
+        { status: 500, headers: cors }
+      );
+    }
+
+    const existingSignalSource = String(existingSignal?.source || "");
+    const autoSignalOwned =
+      existingSignalSource.startsWith("KCCS AUTO MODEL");
+
+    if (
+      existingSignal?.status === "CONFIRMED" &&
+      !autoSignalOwned &&
+      body.force !== true
+    ) {
+      return Response.json(
+        {
+          ...responseBase,
+          status: "SKIPPED",
+          reason: "EXISTING_MANUAL_SIGNAL_PROTECTED",
+          existingSignalSource,
+        },
+        { status: 200, headers: { ...cors, "Cache-Control": "no-store" } }
+      );
     }
 
     const { data: saved, error: saveError } = await supabase
