@@ -34,7 +34,7 @@ type ManualBody = {
 };
 
 const KST = "Asia/Seoul";
-const SERVICE_VERSION = "kccs-finalize-v4-yahoo";
+const SERVICE_VERSION = "kccs-finalize-v5-actual-priority";
 
 const n = (value: unknown) => {
   const parsed = Number(value ?? 0);
@@ -576,10 +576,16 @@ export default {
       pnl_on_100k: round(dailyReturn * 1000, 2),
       trade_count: 0,
       max_drawdown: 0,
-      data_source: `KCCS 자동 확정 · ${market.source}`,
-      calculation_version: signal.model_version
-        ? `kccs-auto-v1:${signal.model_version}`
-        : "kccs-auto-v1",
+      data_source: String(signal.source || "").startsWith("KCCS AUTO MODEL")
+        ? `KCCS 자동 확정 · ${market.source}`
+        : `KCCS 실제 확정 · ${market.source}`,
+      calculation_version: String(signal.source || "").startsWith("KCCS AUTO MODEL")
+        ? (signal.model_version
+            ? `kccs-auto-v2:${signal.model_version}`
+            : "kccs-auto-v2")
+        : (signal.model_version
+            ? `kccs-confirmed:${signal.model_version}`
+            : "kccs-confirmed"),
       confirmed_at: nowIso,
       updated_at: nowIso,
     };
