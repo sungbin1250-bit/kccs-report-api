@@ -1,0 +1,571 @@
+import { createClient } from "@supabase/supabase-js";
+
+type Direction = "LONG" | "SHORT" | "WAIT";
+type DecisionState =
+  | "LONG"
+  | "SHORT"
+  | "WAIT"
+  | "LONG_CANDIDATE"
+  | "SHORT_CANDIDATE";
+
+type Body = {
+  date?: string;
+  dryRun?: boolean;
+  force?: boolean;
+};
+
+type PreviousReport = {
+  report_date: string;
+  direction: Direction;
+  underlying_return: number | string | null;
+  status: string;
+};
+
+const SERVICE_VERSION = "kccs-model-auto-v3-live-direction-priority";
+const MODEL_VERSION = "kccs-model-auto-v3-live-hysteresis-030-010";
+const AUTO_START_DATE = "2026-08-12";
+const ENTRY_THRESHOLD = 0.30;
+const EXIT_BUFFER = 0.10;
+const ACTIVE_LEVERAGE = 2;
+const ACTIVE_ALLOCATION = 100;
+const ACTIVE_COST = 0.10;
+const KST = "Asia/Seoul";
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, X-KCCS-Cron-Secret, x-kccs-cron-secret",
+};
+
+const n = (value: unknown) => {
+  const x = Number(value ?? 0);
+  return Number.isFinite(x) ? x : 0;
+};
+
+const round = (value: number, digits = 6) => {
+  const p = 10 ** digits;
+  return Math.round((value + Number.EPSILON) * p) / p;
+};
+
+const kstDate = () =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: KST,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+
+const kstHour = () =>
+  Number(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: KST,
+      hour: "2-digit",
+      hour12: false,
+    }).format(new Date())
+  );
+
+function decide(
+  currentUnderlying: number,
+  previous: PreviousReport | null
+): {
+  direction: Direction;
+  decisionState: DecisionState;
+  reason: string;
+} {
+  const prevDirection: Direction = previous?.direction || "WAIT";
+
+  // LIVE 운용 기준:
+  // +0.30% 초과는 LONG, -0.30% 미만은 SHORT로 즉시 운용합니다.
+  // 직전 방향 유지에는 ±0.10% 히스테리시스 버퍼를 적용합니다.
+  // 따라서 첫 돌파를 WAIT 후보로 묶지 않습니다.
+
+  // 1) Existing LONG: keep through the -0.10 buffer.
+  if (prevDirection === "LONG") {
+    if (currentUnderlying > -EXIT_BUFFER) {
+      return {
+        direction: "LONG",
+        decisionState: "LONG",
+        reason: "PREVIOUS_LONG_MAINTAINED_ABOVE_MINUS_010",
+      };
+    }
+
+    if (currentUnderlying >= -ENTRY_THRESHOLD) {
+      return {
+        direction: "WAIT",
+        decisionState: "WAIT",
+        reason: "PREVIOUS_LONG_EXITED_TO_WAIT_BUFFER",
+      };
+    }
+
+    return {
+      direction: "SHORT",
+      decisionState: "SHORT",
+      reason: "LIVE_SHORT_BREAKOUT_BELOW_MINUS_030",
+    };
+  }
+
+  // 2) Existing SHORT: keep through the +0.10 buffer.
+  if (prevDirection === "SHORT") {
+    if (currentUnderlying < EXIT_BUFFER) {
+      return {
+        direction: "SHORT",
+        decisionState: "SHORT",
+        reason: "PREVIOUS_SHORT_MAINTAINED_BELOW_PLUS_010",
+      };
+    }
+
+    if (currentUnderlying <= ENTRY_THRESHOLD) {
+      return {
+        direction: "WAIT",
+        decisionState: "WAIT",
+        reason: "PREVIOUS_SHORT_EXITED_TO_WAIT_BUFFER",
+      };
+    }
+
+    return {
+      direction: "LONG",
+      decisionState: "LONG",
+      reason: "LIVE_LONG_BREAKOUT_ABOVE_PLUS_030",
+    };
+  }
+
+  // 3) Previous effective position was WAIT.
+  if (currentUnderlying > ENTRY_THRESHOLD) {
+    return {
+      direction: "LONG",
+      decisionState: "LONG",
+      reason: "LIVE_LONG_BREAKOUT_ABOVE_PLUS_030",
+    };
+  }
+
+  if (currentUnderlying < -ENTRY_THRESHOLD) {
+    return {
+      direction: "SHORT",
+      decisionState: "SHORT",
+      reason: "LIVE_SHORT_BREAKOUT_BELOW_MINUS_030",
+    };
+  }
+
+  return {
+    direction: "WAIT",
+    decisionState: "WAIT",
+    reason: "INSIDE_NEUTRAL_ZONE",
+  };
+}
+
+async function postJson(
+  url: string,
+  secret: string,
+  body: unknown
+) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-kccs-cron-secret": secret,
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+
+  const raw = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = { raw };
+  }
+
+  if (!res.ok) {
+    const error = new Error(`HTTP_${res.status}`);
+    (error as any).response = data;
+    throw error;
+  }
+
+  return data;
+}
+
+export default {
+  async fetch(request: Request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
+    if (request.method === "GET") {
+      return Response.json(
+        {
+          ok: true,
+          service: "kccs-model-auto",
+          version: SERVICE_VERSION,
+          rules: {
+            entryThreshold: ENTRY_THRESHOLD,
+            exitBuffer: EXIT_BUFFER,
+            confirmation: "LIVE_THRESHOLD_WITH_HYSTERESIS",
+            candidateEffectiveDirection: "ACTIVE_DIRECTION",
+            activeLeverage: ACTIVE_LEVERAGE,
+            activeAllocation: ACTIVE_ALLOCATION,
+            activeEstimatedCost: ACTIVE_COST,
+            waitLeverage: 0,
+            autoStartDate: AUTO_START_DATE,
+            priority: "CONFIRMED_ACTUAL_SIGNAL_FIRST",
+          },
+        },
+        {
+          status: 200,
+          headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
+        }
+      );
+    }
+
+    if (request.method !== "POST") {
+      return Response.json(
+        { error: "METHOD_NOT_ALLOWED" },
+        { status: 405, headers: { ...cors, Allow: "GET, POST" } }
+      );
+    }
+
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const supabaseSecretKey = process.env.SUPABASE_SECRET_KEY;
+    const cronSecret = process.env.KCCS_CRON_SECRET;
+
+    if (!supabaseUrl || !supabaseSecretKey || !cronSecret) {
+      return Response.json(
+        { error: "SERVER_NOT_CONFIGURED" },
+        { status: 500, headers: cors }
+      );
+    }
+
+    const receivedSecret =
+      request.headers.get("x-kccs-cron-secret") ||
+      request.headers.get("X-KCCS-Cron-Secret") ||
+      "";
+
+    if (receivedSecret !== cronSecret) {
+      return Response.json(
+        { error: "UNAUTHORIZED" },
+        { status: 401, headers: cors }
+      );
+    }
+
+    let body: Body = {};
+    try {
+      body = (await request.json()) as Body;
+    } catch {
+      body = {};
+    }
+
+    const targetDate = body.date || kstDate();
+    const dryRun = body.dryRun !== false;
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      return Response.json(
+        { error: "INVALID_DATE" },
+        { status: 400, headers: cors }
+      );
+    }
+
+    if (!dryRun && targetDate === kstDate() && kstHour() < 17) {
+      return Response.json(
+        {
+          ok: true,
+          status: "SKIPPED",
+          reason: "BEFORE_17_KST",
+          targetDate,
+        },
+        { status: 200, headers: { ...cors, "Cache-Control": "no-store" } }
+      );
+    }
+
+    const origin = new URL(request.url).origin;
+
+    let market: any;
+    try {
+      market = await postJson(
+        `${origin}/api/kccs/market-yahoo-v1`,
+        cronSecret,
+        { date: targetDate }
+      );
+    } catch (error) {
+      return Response.json(
+        {
+          ok: false,
+          error: "MARKET_DATA_ERROR",
+          detail: (error as any)?.response || String(error),
+        },
+        { status: 502, headers: { ...cors, "Cache-Control": "no-store" } }
+      );
+    }
+
+    if (!market?.ok || market?.status !== "READY") {
+      return Response.json(
+        {
+          ok: false,
+          status: "WAITING",
+          reason: "MARKET_NOT_READY",
+          market,
+        },
+        { status: 425, headers: { ...cors, "Cache-Control": "no-store" } }
+      );
+    }
+
+    const currentUnderlying = round(n(market.underlyingReturn), 6);
+
+    const supabase = createClient(supabaseUrl, supabaseSecretKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+
+    // Protect an already-confirmed non-auto customer ledger.
+    const { data: existingReport, error: existingReportError } =
+      await supabase
+        .from("kccs_daily_reports")
+        .select("report_date,status,data_source,calculation_version")
+        .eq("report_date", targetDate)
+        .maybeSingle();
+
+    if (existingReportError) {
+      return Response.json(
+        {
+          error: "EXISTING_REPORT_READ_ERROR",
+          message: existingReportError.message,
+        },
+        { status: 500, headers: cors }
+      );
+    }
+
+    const existingSource = String(existingReport?.data_source || "");
+    const autoOwned =
+      existingSource.startsWith("KCCS 자동 확정") ||
+      String(existingReport?.calculation_version || "").startsWith(
+        "kccs-auto-"
+      );
+
+    if (
+      existingReport?.status === "CONFIRMED" &&
+      !autoOwned &&
+      body.force !== true &&
+      !dryRun
+    ) {
+      return Response.json(
+        {
+          ok: true,
+          status: "SKIPPED",
+          reason: "EXISTING_CONFIRMED_ROW_PROTECTED",
+          targetDate,
+          existingDataSource: existingReport.data_source,
+        },
+        { status: 200, headers: { ...cors, "Cache-Control": "no-store" } }
+      );
+    }
+
+    // A confirmed non-auto signal is the authoritative KCCS decision.
+    // This is checked BEFORE the automatic model. Therefore an actual
+    // operator-confirmed LONG/SHORT/WAIT can never be replaced by the
+    // candidate/hysteresis algorithm for the same trading day.
+    const { data: existingSignalData, error: existingSignalReadError } =
+      await supabase
+        .from("kccs_model_signals")
+        .select(
+          "report_date,status,direction,leverage,allocation,estimated_cost,model_version,source,confirmed_at"
+        )
+        .eq("report_date", targetDate)
+        .eq("status", "CONFIRMED")
+        .maybeSingle();
+
+    if (existingSignalReadError) {
+      return Response.json(
+        {
+          error: "EXISTING_SIGNAL_READ_ERROR",
+          message: existingSignalReadError.message,
+        },
+        { status: 500, headers: cors }
+      );
+    }
+
+    const existingSignalSource = String(existingSignalData?.source || "");
+    const isExistingAutoSignal =
+      existingSignalSource.startsWith("KCCS AUTO MODEL");
+
+    if (existingSignalData && !isExistingAutoSignal) {
+      const actualDirection = existingSignalData.direction as Direction;
+      const actualLeverage =
+        actualDirection === "WAIT" ? 0 : Math.max(0, n(existingSignalData.leverage));
+      const actualAllocation =
+        actualDirection === "WAIT"
+          ? 0
+          : Math.min(100, Math.max(0, n(existingSignalData.allocation)));
+      const actualEstimatedCost =
+        actualDirection === "WAIT"
+          ? 0
+          : Math.max(0, n(existingSignalData.estimated_cost));
+
+      return Response.json(
+        {
+          ok: true,
+          serviceVersion: SERVICE_VERSION,
+          status: dryRun ? "DRY_RUN_OK" : "SIGNAL_CONFIRMED",
+          targetDate,
+          authoritativeSignal: true,
+          authoritativeSource: existingSignalSource,
+          market: {
+            samsungReturn: market.stocks?.["005930"]?.changeRate,
+            skHynixReturn: market.stocks?.["000660"]?.changeRate,
+            underlyingReturn: currentUnderlying,
+          },
+          previousReport: null,
+          decision: {
+            direction: actualDirection,
+            decisionState: actualDirection,
+            reason: "CONFIRMED_ACTUAL_SIGNAL_PRIORITY",
+            leverage: actualLeverage,
+            allocation: actualAllocation,
+            estimatedCost: actualEstimatedCost,
+          },
+          signalPreview: existingSignalData,
+          rules: {
+            entryThreshold: ENTRY_THRESHOLD,
+            exitBuffer: EXIT_BUFFER,
+            confirmation: "LIVE_THRESHOLD_WITH_HYSTERESIS",
+            candidateEffectiveDirection: "ACTIVE_DIRECTION",
+            autoStartDate: AUTO_START_DATE,
+            priority: "CONFIRMED_ACTUAL_SIGNAL_FIRST",
+          },
+        },
+        {
+          status: 200,
+          headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
+        }
+      );
+    }
+
+    // Before the automatic model launch date, an actual confirmed signal
+    // is mandatory. This makes 2026-08-11 the human-confirmed baseline
+    // and starts automatic decisions from 2026-08-12.
+    if (targetDate < AUTO_START_DATE) {
+      return Response.json(
+        {
+          ok: true,
+          status: "WAITING",
+          reason: "ACTUAL_SIGNAL_REQUIRED_BEFORE_AUTO_START",
+          targetDate,
+          autoStartDate: AUTO_START_DATE,
+        },
+        {
+          status: 200,
+          headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
+        }
+      );
+    }
+
+    // Previous confirmed trading report, regardless of month.
+    const { data: previousRows, error: previousError } = await supabase
+      .from("kccs_daily_reports")
+      .select("report_date,direction,underlying_return,status")
+      .eq("status", "CONFIRMED")
+      .lt("report_date", targetDate)
+      .order("report_date", { ascending: false })
+      .limit(1);
+
+    if (previousError) {
+      return Response.json(
+        {
+          error: "PREVIOUS_REPORT_READ_ERROR",
+          message: previousError.message,
+        },
+        { status: 500, headers: cors }
+      );
+    }
+
+    const previous =
+      previousRows && previousRows.length > 0
+        ? (previousRows[0] as PreviousReport)
+        : null;
+
+    const decision = decide(currentUnderlying, previous);
+
+    const leverage =
+      decision.direction === "WAIT" ? 0 : ACTIVE_LEVERAGE;
+    const allocation =
+      decision.direction === "WAIT" ? 0 : ACTIVE_ALLOCATION;
+    const estimatedCost =
+      decision.direction === "WAIT" ? 0 : ACTIVE_COST;
+
+    const nowIso = new Date().toISOString();
+
+    const signalRow = {
+      report_date: targetDate,
+      status: "CONFIRMED",
+      direction: decision.direction,
+      leverage,
+      allocation,
+      estimated_cost: estimatedCost,
+      model_version: MODEL_VERSION,
+      source: `KCCS AUTO MODEL · ${decision.decisionState}`,
+      confirmed_at: nowIso,
+      updated_at: nowIso,
+    };
+
+    const responseBase = {
+      ok: true,
+      serviceVersion: SERVICE_VERSION,
+      status: dryRun ? "DRY_RUN_OK" : "SIGNAL_CONFIRMED",
+      targetDate,
+      market: {
+        samsungReturn: market.stocks?.["005930"]?.changeRate,
+        skHynixReturn: market.stocks?.["000660"]?.changeRate,
+        underlyingReturn: currentUnderlying,
+      },
+      previousReport: previous,
+      decision: {
+        ...decision,
+        leverage,
+        allocation,
+        estimatedCost,
+      },
+      signalPreview: signalRow,
+      rules: {
+        entryThreshold: ENTRY_THRESHOLD,
+        exitBuffer: EXIT_BUFFER,
+        confirmation: "LIVE_THRESHOLD_WITH_HYSTERESIS",
+        candidateEffectiveDirection: "ACTIVE_DIRECTION",
+        autoStartDate: AUTO_START_DATE,
+        priority: "CONFIRMED_ACTUAL_SIGNAL_FIRST",
+      },
+    };
+
+    if (dryRun) {
+      return Response.json(responseBase, {
+        status: 200,
+        headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
+      });
+    }
+
+    const { data: saved, error: saveError } = await supabase
+      .from("kccs_model_signals")
+      .upsert(signalRow, { onConflict: "report_date" })
+      .select()
+      .single();
+
+    if (saveError) {
+      return Response.json(
+        {
+          error: "AUTO_SIGNAL_UPSERT_ERROR",
+          message: saveError.message,
+        },
+        { status: 500, headers: cors }
+      );
+    }
+
+    return Response.json(
+      {
+        ...responseBase,
+        status: "SIGNAL_CONFIRMED",
+        signal: saved,
+      },
+      {
+        status: 200,
+        headers: { ...cors, "Cache-Control": "no-store, max-age=0" },
+      }
+    );
+  },
+};
