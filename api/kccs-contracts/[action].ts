@@ -198,6 +198,41 @@ function mapRow(row: any) {
   }
 }
 
+
+function mapDocument(row: any) {
+  if (!row) return null
+
+  return {
+    applicationId: row.application_id || "",
+    applicationDate: row.application_date || "",
+    pbcode: row.pbcode || "",
+    name: row.name || "",
+    birth: row.birth || "",
+    phone: row.phone || "",
+    email: row.email || "",
+    address: row.address || "",
+    applicationAmount: row.application_amount,
+    currency: row.currency || "USDT",
+    depositAmount: row.deposit_amount,
+    depositDate: row.deposit_date || "",
+    txid: row.txid || "",
+    mismatchReason: row.mismatch_reason || "",
+    mismatchNote: row.mismatch_note || "",
+    contractNo: row.contract_no || "",
+    status: row.status || "",
+    publicToken: row.public_token || "",
+    companySigner: row.company_signer || "",
+    companySignatureData: row.company_signature_data || "",
+    riskAgreed: Boolean(row.risk_agreed),
+    infoAgreed: Boolean(row.info_agreed),
+    signedName: row.signed_name || "",
+    customerSignatureData: row.customer_signature_data || "",
+    signedAt: row.signed_at || "",
+    createdAt: row.created_at || "",
+    updatedAt: row.updated_at || "",
+  }
+}
+
 function signBaseUrl() {
   return String(
     process.env.KCCS_CUSTOMER_SIGN_BASE_URL ||
@@ -224,7 +259,7 @@ async function health(req: any, res: any) {
   return res.status(200).json({
     ok: true,
     service: "kccs-remote-esign",
-    version: "kccs-contract-api-single-function-v1",
+    version: "kccs-contract-api-single-function-v2-pdf",
   })
 }
 
@@ -596,6 +631,60 @@ async function sign(req: any, res: any) {
   })
 }
 
+
+async function documentData(req: any, res: any) {
+  if (!requireOfficeKey(req, res)) return
+
+  if (req.method !== "GET") {
+    return res.status(405).json({ ok: false, error: "GET only" })
+  }
+
+  const token = String(req.query?.token || "")
+
+  if (!token) {
+    return res.status(400).json({
+      ok: false,
+      error: "token required",
+    })
+  }
+
+  const rows = await supabase(
+    `kccs_contracts?public_token=eq.${encodeURIComponent(
+      token
+    )}&select=*&limit=1`,
+    { method: "GET" }
+  )
+
+  const contract = rows?.[0]
+
+  if (!contract) {
+    return res.status(404).json({
+      ok: false,
+      error: "계약을 찾을 수 없습니다.",
+    })
+  }
+
+  if (contract.status !== "서명완료") {
+    return res.status(409).json({
+      ok: false,
+      error: "고객 전자서명이 완료된 뒤 계약서 PDF를 저장할 수 있습니다.",
+      status: contract.status || "",
+    })
+  }
+
+  if (!contract.customer_signature_data || !contract.signed_at) {
+    return res.status(409).json({
+      ok: false,
+      error: "서명 이미지 또는 서명 완료시각이 아직 저장되지 않았습니다.",
+    })
+  }
+
+  return res.status(200).json({
+    ok: true,
+    document: mapDocument(contract),
+  })
+}
+
 async function status(req: any, res: any) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "GET only" })
@@ -661,6 +750,8 @@ export default async function handler(req: any, res: any) {
         return await sign(req, res)
       case "status":
         return await status(req, res)
+      case "document":
+        return await documentData(req, res)
       default:
         return res.status(404).json({
           ok: false,
