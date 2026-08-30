@@ -20,6 +20,37 @@ const DEFAULT_ORIGINS = [
 
 type JsonRecord = Record<string, any>
 
+const CURRENT_CONTRACT_TEMPLATE_CODE = "KCCS-AGR-2026-01"
+
+const CURRENT_AGREEMENT_SNAPSHOT = Object.freeze({
+  templateCode: CURRENT_CONTRACT_TEMPLATE_CODE,
+  agreementTitle: "KCCS 전략운용·정산 서비스 이용계약서",
+
+  managementFeePercent: 0.7,
+  managementFeeBasis: "settlement_period_average_managed_balance",
+  managementFeeSettlement: "monthly_and_contract_termination_prorated",
+
+  performanceFeePercent: 1.2,
+  performanceFeeMethod: "high_water_mark",
+  lossCarryForward: true,
+
+  tradingFeePercent: 0.19,
+  tradingFeeBasis: "executed_notional",
+
+  fundingFeePercent: 0.013,
+  fundingFeeBasis: "position_notional_at_funding_time",
+
+  withdrawalFeePercent: 0.07,
+  withdrawalFeeBasis: "withdrawal_amount",
+
+  fxFeePercent: 0,
+  withdrawalProcessingBusinessDays: 2,
+})
+
+function cloneAgreementSnapshot() {
+  return JSON.parse(JSON.stringify(CURRENT_AGREEMENT_SNAPSHOT))
+}
+
 function allowedOrigins() {
   const env = String(process.env.KCCS_ALLOWED_ORIGINS || "")
     .split(",")
@@ -193,6 +224,10 @@ function mapRow(row: any) {
     depositDate: row.deposit_date || "",
     txid: row.txid || "",
     contractNo: row.contract_no || "",
+    contractTemplateCode:
+      row.contract_template_code || CURRENT_CONTRACT_TEMPLATE_CODE,
+    agreementSnapshot:
+      row.agreement_snapshot || cloneAgreementSnapshot(),
     publicToken: row.public_token || "",
     signedAt: row.signed_at || "",
   }
@@ -219,6 +254,12 @@ function mapDocument(row: any) {
     mismatchReason: row.mismatch_reason || "",
     mismatchNote: row.mismatch_note || "",
     contractNo: row.contract_no || "",
+    contractTemplateCode:
+      row.contract_template_code || CURRENT_CONTRACT_TEMPLATE_CODE,
+    agreementSnapshot:
+      row.agreement_snapshot || cloneAgreementSnapshot(),
+    documentHash: row.document_hash || "",
+    documentGeneratedAt: row.document_generated_at || "",
     status: row.status || "",
     publicToken: row.public_token || "",
     companySigner: row.company_signer || "",
@@ -259,7 +300,9 @@ async function health(req: any, res: any) {
   return res.status(200).json({
     ok: true,
     service: "kccs-remote-esign",
-    version: "kccs-contract-api-single-function-v2-pdf",
+    version: "kccs-contract-api-single-function-v3-template-lock",
+    contractTemplateCode: CURRENT_CONTRACT_TEMPLATE_CODE,
+    agreementSnapshotConfigured: true,
   })
 }
 
@@ -365,6 +408,29 @@ async function finalize(req: any, res: any) {
   )
 
   const previous = existing?.[0] || null
+
+  if (previous?.status === "서명완료") {
+    return res.status(409).json({
+      ok: false,
+      error:
+        "이미 전자서명이 완료된 계약은 다시 확정하거나 서명링크를 재발급할 수 없습니다.",
+      contractNo: previous.contract_no || "",
+    })
+  }
+
+  const shouldPreserveExistingTerms =
+    previous?.status === "서명대기" &&
+    Boolean(previous?.contract_template_code) &&
+    Boolean(previous?.agreement_snapshot)
+
+  const contractTemplateCode = shouldPreserveExistingTerms
+    ? String(previous.contract_template_code)
+    : CURRENT_CONTRACT_TEMPLATE_CODE
+
+  const agreementSnapshot = shouldPreserveExistingTerms
+    ? previous.agreement_snapshot
+    : cloneAgreementSnapshot()
+
   const code = newCode()
   const salt = newToken()
   const token = newToken()
@@ -393,6 +459,10 @@ async function finalize(req: any, res: any) {
     mismatch_reason: String(body.mismatchReason || ""),
     mismatch_note: String(body.mismatchNote || ""),
     contract_no: contractNo,
+    contract_template_code: contractTemplateCode,
+    agreement_snapshot: agreementSnapshot,
+    document_hash: null,
+    document_generated_at: null,
     status: "서명대기",
     public_token: token,
     verification_code_salt: salt,
@@ -424,6 +494,8 @@ async function finalize(req: any, res: any) {
     ok: true,
     row: mapRow(data?.[0] || row),
     contractNo,
+    contractTemplateCode,
+    agreementSnapshot,
     code,
     publicToken: token,
     signUrl,
@@ -468,6 +540,8 @@ async function verify(req: any, res: any) {
       alreadySigned: true,
       signedAt: contract.signed_at,
       contractNo: contract.contract_no,
+      contractTemplateCode:
+        contract.contract_template_code || CURRENT_CONTRACT_TEMPLATE_CODE,
     })
   }
 
@@ -506,6 +580,10 @@ async function verify(req: any, res: any) {
     ok: true,
     contract: {
       contractNo: contract.contract_no,
+      contractTemplateCode:
+        contract.contract_template_code || CURRENT_CONTRACT_TEMPLATE_CODE,
+      agreementSnapshot:
+        contract.agreement_snapshot || cloneAgreementSnapshot(),
       name: contract.name,
       birth: contract.birth,
       applicationAmount: contract.application_amount,
@@ -718,6 +796,8 @@ async function status(req: any, res: any) {
   return res.status(200).json({
     ok: true,
     contractNo: contract.contract_no,
+    contractTemplateCode:
+      contract.contract_template_code || CURRENT_CONTRACT_TEMPLATE_CODE,
     status: contract.status,
     signedAt: contract.signed_at || "",
   })
