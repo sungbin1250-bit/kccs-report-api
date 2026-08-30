@@ -21,6 +21,7 @@ const DEFAULT_ORIGINS = [
 type JsonRecord = Record<string, any>
 
 const CURRENT_CONTRACT_TEMPLATE_CODE = "KCCS-AGR-2026-01"
+const COMPANY_SIGNING_PROFILE_KEY = "default"
 
 const CURRENT_AGREEMENT_SNAPSHOT = Object.freeze({
   templateCode: CURRENT_CONTRACT_TEMPLATE_CODE,
@@ -49,6 +50,61 @@ const CURRENT_AGREEMENT_SNAPSHOT = Object.freeze({
 
 function cloneAgreementSnapshot() {
   return JSON.parse(JSON.stringify(CURRENT_AGREEMENT_SNAPSHOT))
+}
+
+type CompanySigningProfile = {
+  companyName: string
+  signerName: string
+  signerTitle: string
+  signatureData: string
+  signatureSha256: string
+}
+
+async function loadCompanySigningProfile(): Promise<CompanySigningProfile> {
+  const rows = await supabase(
+    `kccs_company_signing_profile?profile_key=eq.${encodeURIComponent(
+      COMPANY_SIGNING_PROFILE_KEY
+    )}&active=eq.true&select=company_name,signer_name,signer_title,signature_data,signature_sha256&limit=1`,
+    { method: "GET" }
+  )
+
+  const profile = rows?.[0]
+
+  if (!profile) {
+    throw new Error(
+      "활성화된 회사 승인권자 고정서명 프로필을 찾을 수 없습니다."
+    )
+  }
+
+  const companyName = String(profile.company_name || "").trim()
+  const signerName = String(profile.signer_name || "").trim()
+  const signerTitle = String(profile.signer_title || "").trim()
+  const signatureData = String(profile.signature_data || "")
+  const signatureSha256 = String(profile.signature_sha256 || "").trim()
+
+  if (companyName !== "ARC BASIS Asset Management Limited") {
+    throw new Error("회사 고정서명 프로필의 법인명이 올바르지 않습니다.")
+  }
+
+  if (signerName !== "정연우") {
+    throw new Error("회사 고정 승인권자 성명이 정연우로 설정되지 않았습니다.")
+  }
+
+  if (!signatureData.startsWith("data:image/png;base64,")) {
+    throw new Error("회사 고정서명 이미지 형식이 올바르지 않습니다.")
+  }
+
+  if (!signatureSha256) {
+    throw new Error("회사 고정서명 해시값이 없습니다.")
+  }
+
+  return {
+    companyName,
+    signerName,
+    signerTitle,
+    signatureData,
+    signatureSha256,
+  }
 }
 
 function allowedOrigins() {
@@ -297,12 +353,19 @@ async function health(req: any, res: any) {
     method: "GET",
   })
 
+  const companyProfile = await loadCompanySigningProfile()
+
   return res.status(200).json({
     ok: true,
     service: "kccs-remote-esign",
-    version: "kccs-contract-api-single-function-v3-template-lock",
+    version: "kccs-contract-api-single-function-v4-company-sign-lock",
     contractTemplateCode: CURRENT_CONTRACT_TEMPLATE_CODE,
     agreementSnapshotConfigured: true,
+    companySigningProfileConfigured: true,
+    companyName: companyProfile.companyName,
+    companySigner: companyProfile.signerName,
+    companySignerTitle: companyProfile.signerTitle,
+    companySignatureSha256: companyProfile.signatureSha256,
   })
 }
 
@@ -431,6 +494,10 @@ async function finalize(req: any, res: any) {
     ? previous.agreement_snapshot
     : cloneAgreementSnapshot()
 
+  // 직원 브라우저의 회사 이름·서명 입력값은 사용하지 않습니다.
+  // Supabase의 비공개 고정서명 프로필만 신규 계약에 적용합니다.
+  const companyProfile = await loadCompanySigningProfile()
+
   const code = newCode()
   const salt = newToken()
   const token = newToken()
@@ -468,8 +535,8 @@ async function finalize(req: any, res: any) {
     verification_code_salt: salt,
     verification_code_hash: await sha256(`${salt}:${code}`),
     code_expires_at: expiresAt,
-    company_signer: String(body.companySigner || ""),
-    company_signature_data: String(body.companySign || ""),
+    company_signer: companyProfile.signerName,
+    company_signature_data: companyProfile.signatureData,
     risk_agreed: false,
     info_agreed: false,
     signed_name: null,
@@ -500,6 +567,10 @@ async function finalize(req: any, res: any) {
     publicToken: token,
     signUrl,
     expiresAt,
+    companyName: companyProfile.companyName,
+    companySigner: companyProfile.signerName,
+    companySignerTitle: companyProfile.signerTitle,
+    companySignatureSha256: companyProfile.signatureSha256,
   })
 }
 
